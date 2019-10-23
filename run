@@ -1,0 +1,12 @@
+#!/bin/sh
+
+if [ ! -f "/app/per-boot/reroot" ]; then
+    echo "Dropping reroot in /var/lib/cloud/scripts/per-boot"
+    cp /app/reroot /app/per-boot
+
+    echo "Rebooting..."
+    /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl reboot
+fi
+
+echo "Already configured, sleeping forever"
+while true; do sleep 3600; done
