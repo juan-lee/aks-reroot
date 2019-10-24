@@ -5,6 +5,8 @@ if [ ! -f "/app/per-boot/reroot" ]; then
     cp /app/reroot /app/per-boot
 
     echo "Rebooting..."
+    /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl disable docker
+    /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl disable kubelet
     /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl reboot
 fi
 
