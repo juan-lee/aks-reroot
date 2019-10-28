@@ -1,14 +1,44 @@
 #!/bin/sh
 
-if [ ! -f "/app/per-boot/reroot" ]; then
-    echo "Dropping reroot in /var/lib/cloud/scripts/per-boot"
-    cp /app/reroot /app/per-boot
+if [[ "${MODE}" == "INIT" ]]; then
 
-    echo "Rebooting..."
-    /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl disable docker
-    /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl disable kubelet
-    /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl reboot
+    echo "Intializing reroot configuration"
+    
+    DIFF=$(diff /app/reroot /app/per-boot/reroot > /dev/null 2>&1 )
+    
+    if [[ $? != 0 ]]; then      
+        echo "reroot not found or does not match expected content"
+        echo "creating reroot in /var/lib/cloud/scripts/per-boot"
+        echo "Rebooting..."
+
+        cp /app/reroot /app/per-boot
+        chown root:root /app/per-boot/reroot
+        chmod +700 /app/per-boot/reroot
+
+        /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl disable docker
+        /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl disable kubelet
+        /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl reboot
+    fi
+    echo "Found reroot and content matches"
+    echo "Intialization complete"
+    exit 0
 fi
 
-echo "Already configured, sleeping forever"
-while true; do sleep 3600; done
+if [[ "${MODE}" == "RUN" ]]; then
+
+    # if we retained priviledged execution, we could make a host level
+    # check to see if the system is still configuring, or in the expected
+    # state of reroot, and offer liveness and readiness probes
+    # but as the container runs forever, it presents a added security risk. 
+
+    # this assumes the pod is stuck at init until docker is restarted at the
+    # end of reroot script after reboot. If the container gets to this point
+    # reroot must be successful and the initial state is ready. 
+
+    echo "Reroot is already configured, sleeping forever"
+    while true; do sleep 3600; done
+
+fi
+
+echo "Error: improper mode '${MODE}' selected"
+exit 1
