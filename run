@@ -13,7 +13,7 @@ if [[ "${MODE}" == "INIT" ]]; then
 
         cp /app/reroot /app/per-boot
         chown root:root /app/per-boot/reroot
-        chmod +700 /app/per-boot/reroot
+        chmod 700 /app/per-boot/reroot
 
         /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl disable docker
         /usr/bin/nsenter -m/proc/1/ns/mnt /bin/systemctl disable kubelet
