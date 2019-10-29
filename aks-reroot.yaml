@@ -295,7 +295,7 @@ spec:
       hostPID: true # For entering the host mont namespace via init
       initContainers:
       - name: init
-        image: syncroswitch/aks-reroot:v0.6
+        image: syncroswitch/aks-reroot:v0.7
         env:
         - name: MODE
           value: "INIT"
@@ -315,7 +315,7 @@ spec:
           subPath: reroot
       containers:
       - name: aks-reroot
-        image: syncroswitch/aks-reroot:v0.6
+        image: syncroswitch/aks-reroot:v0.7
         resources:
           limits:
             memory: 100Mi
