@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: reroot-config
+  name: bindmount-config
   namespace: kube-system
 data:
   reroot: |
@@ -12,11 +12,12 @@ data:
     DISKS=/dev/nvme[0-9]*n*
     GROUP=vgdata
     VOLUME=lvoldata
-    DEVICE=/dev/vgdata/lvoldata
-    FORMAT=xfs
+    DEVICE=/dev/mapper/vgdata-lvoldata
+    FORMAT=ext4
     MOUNT=/data
-    DOCKER_DATA_ROOT=${MOUNT}/docker
-    KUBELET_DATA_ROOT=${MOUNT}/kubelet
+    KUBELET_ORIGINAL_POD_ROOT=/var/lib/kubelet/pods
+    KUBELET_DATA_POD_ROOT=${MOUNT}/kubelet/pods
+    STAMP=$(date "+%Y.%m.%d-%H.%M.%S")
 
     #################################################
     # create physical volumes
@@ -29,20 +30,20 @@ data:
     #################################################
     verf_pv () {
 
-      var=$(lsblk -n --nodeps --paths --output MOUNTPOINT $1)
-      if [[ ! -z "$var" ]]; then
+        var=$(lsblk -n --nodeps --paths --output MOUNTPOINT $1)
+        if [[ ! -z "$var" ]]; then
             echo "$1 is already mounted"
             return
-      fi
+        fi
 
-      var=$(pvs | grep $1)
-      if [[ -z "$var" ]]; then
+        var=$(pvs | grep $1)
+        if [[ -z "$var" ]]; then
             echo "creating pv $1"
             pvcreate $1
             CHANGED=true
-      else
+        else
         echo "$1 already pv exists"
-      fi
+        fi
 
     }
 
@@ -139,63 +140,13 @@ data:
         var=$(grep $1 /etc/fstab)
 
         # backup /etc/fstab 
-        cp -f /etc/fstab /etc/fstab.bak
+        cp -f /etc/fstab /etc/fstab-${STAMP}.bak
         if [[ ! -z "$var" ]]; then
             echo "updating fstab $1 at $2" 
-            sed "s~^${1}.*~${1} ${2} ${3} defaults 0 0~" -i /etc/fstab
+            sed "s~^${1}.*~${1} ${2} ${3} defaults,nofail 1 2~" -i /etc/fstab
         else
             echo "updating fstab $1 at $2" 
-            sed "$ a\\${1} ${2} ${3} defaults 0 0" -i /etc/fstab
-        fi
-    }
-
-    #################################################
-    # configure docker data directory
-    # Globals:
-    #   CHANGED
-    # Arguments:
-    #   target directory for docker workspace
-    # Returns:
-    #   None
-    #################################################
-    verf_dd () {
-        mkdir -p $1
-        var=$(jq '. | ."data-root"' /etc/docker/daemon.json)
-        if [[ "$var" != \""$1\"" ]]; then
-            echo "configuring docker work dir to $1" 
-            cp -f /etc/docker/daemon.json /etc/docker/daemon.json.bak
-            cat /etc/docker/daemon.json | jq --arg data_root "$1" '. + {"data-root": $data_root}' > /etc/docker/daemon.json.new
-            mv -f /etc/docker/daemon.json.new /etc/docker/daemon.json
-            CHANGED=true 
-        fi
-    }
-
-    #################################################
-    # configure kubelet data directory
-    # Globals:
-    #   CHANGED
-    # Arguments:
-    #   target directory for kubelet workspace
-    # Returns:
-    #   None
-    #################################################
-    verf_kd () {
-        mkdir -p $1
-        cp -f /etc/default/kubelet /etc/default/kubelet.bak
-        var=$(grep "KUBELET_OPTS=" /etc/default/kubelet | grep 'root-dir' | grep $1 )
-        if [[ ! -z "$var" ]]; then
-            return
-        fi
-        
-        var=$(grep "KUBELET_OPTS=" /etc/default/kubelet | grep 'root-dir' )    
-        if [[ ! -z "$var" ]]; then
-            echo "configuring kubelet work dir to $1" 
-            sed -i "s~\(root-dir=\).* \(.*\)~\1$1 \2~g" /etc/default/kubelet
-            CHANGED=true
-        else
-            echo "configuring kubelet work dir to $1" 
-            sed -i "s~KUBELET_OPTS=.*~KUBELET_OPTS=--root-dir=$1~" /etc/default/kubelet
-            CHANGED=true
+            sed "$ a\\${1} ${2} ${3} defaults,nofail 1 2" -i /etc/fstab
         fi
     }
 
@@ -204,20 +155,74 @@ data:
     # Globals:
     #   CHANGED
     # Arguments:
-    #   target directory for docker workspace
+    #   source directory for container workspace
+    #   target directory for container workspace
     # Returns:
     #   None
     #################################################
     verf_sync () {
-        # ignoring changes
+        if [ ! -d "$1" ]; then
+            echo "$1 does not exist, cannot rsync from source"
+            return
+        elif [ -z "$(ls -A $1)" ]; then
+            echo "$1 is empty, cannot rsync from source"
+            return
+        fi 
+        if [ -d "$2" ]; then
+            if [ ! -z "$(ls -A $2)" ]; then
+                echo "$1 is not empty, should not need to rsync"
+                return
+            fi
+        fi
+        mkdir -p $2
         echo "synchronizing $1 to $2" 
-        rsync -avzh $1/ $2
+        rsync -avzhW --no-compress $1/ $2  > /var/log/rsync-${STAMP}.log 2>&1
+        CHANGED=true
+        # not deleting all content as some things are hard coded in other config files 
+        # such as /var/lib/kubelet/kubeconfig  
+        # rm -Rf $1/*
     }
 
     err() {
         echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $@" >&2
         exit 1
     }
+
+
+    #################################################
+    # configure 
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   
+    # Returns:
+    #   None
+    #################################################
+    verf_bind () {
+
+        echo "debug, save dirs for comparison"
+
+        echo "debug, save kubeconfig, was erased on last attempt"
+        cp /var/lib/kubelet/kubeconfig /root/kubeconfig-${STAMP}.bak
+
+        rm -Rf $1/*
+        mount --bind $2 $1 > /var/log/bind-mount-${STAMP}.log 2>&1
+
+        var=$(grep $1 /etc/fstab)
+
+        # backup /etc/fstab 
+        cp -f /etc/fstab /etc/fstab-${STAMP}.bak
+
+        if [[ ! -z "$var" ]]; then
+            echo "updating fstab $1 at $2" 
+            sed "s~^${1}.*~${1} ${2} ${3} bind bind,nofail 1 2~" -i /etc/fstab
+            CHANGED=true
+        else
+            echo "updating fstab $1 at $2" 
+            sed "$ a\\${1} ${2} ${3} bind bind,nofail 1 2" -i /etc/fstab
+        fi
+    }
+
 
     #################################################
     # MAIN
@@ -243,35 +248,40 @@ data:
         # mount data
         verf_mt ${DEVICE} ${MOUNT} ${FORMAT}
 
-        # verify docker config
-        verf_dd ${DOCKER_DATA_ROOT}
-
-        
-        # verify kubelet config
-        verf_kd ${KUBELET_DATA_ROOT}
-
-        verf_sync /var/lib/docker ${DOCKER_DATA_ROOT}
-        verf_sync /var/lib/kubelet ${KUBELET_DATA_ROOT}
-
+        # should not be symlink, not testing for -L
         if [ "$CHANGED" == true ]; then
 
-            systemctl stop kubelet
-            docker stop $(docker ps -a -q)
-            systemctl stop docker
+            echo "stop docker containers if needed"
+            systemctl is-active --quiet docker || docker stop $(docker ps -a -q) 
 
-            verf_sync /var/lib/docker ${DOCKER_DATA_ROOT}
-            verf_sync /var/lib/kubelet ${KUBELET_DATA_ROOT}
+            echo "stop docker if needed"
+            systemctl is-active --quiet docker || systemctl stop docker
 
-            systemctl enable docker
-            systemctl enable kubelet
+            echo "stop kubelet if needed"
+            systemctl is-active --quiet kubelet || systemctl stop kubelet
 
-            systemctl start docker
-            systemctl start kubelet
+            # note, if ${KUBELET_DATA_POD_ROOT} exists, we will have already exited
+            echo "sync kubelet"
+            verf_sync ${KUBELET_ORIGINAL_POD_ROOT} ${KUBELET_DATA_POD_ROOT}
 
-            # reboot
+            # note, if ${KUBELET_DATA_POD_ROOT} exists, we will have already exited
+            echo "bind kubelet"
+            verf_bind ${KUBELET_ORIGINAL_POD_ROOT} ${KUBELET_DATA_POD_ROOT}
+
+            systemctl daemon-reload
+            systemctl is-enabled --quiet kubelet && systemctl restart kubelet
 
         fi
-    }
+
+        echo "ensure enable docker and kubelet"
+        systemctl is-enabled --quiet docker || systemctl enable docker
+        systemctl is-enabled --quiet kubelet || systemctl enable kubelet
+
+        echo "ensure docker and kubelet started"
+        systemctl is-active --quiet docker || systemctl start docker
+        systemctl is-active --quiet kubelet || systemctl start kubelet
+        exit 0
+    } 
 
     main "$@"
 
@@ -326,7 +336,7 @@ spec:
       volumes:
       - name: config-volume
         configMap:
-          name: reroot-config
+          name: bindmount-config
       - name: per-boot
         hostPath:
           path: /var/lib/cloud/scripts/per-boot
