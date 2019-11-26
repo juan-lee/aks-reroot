@@ -91,7 +91,7 @@ data:
         fi
         mkdir -p $2
         echo "synchronizing $1 to $2" 
-        rsync -avzhW --no-compress $1/ $2  > /var/log/rsync-${STAMP}.log 2>&1
+        rsync -avhW --no-compress $1/ $2  > /var/log/rsync-${STAMP}.log 2>&1
         CHANGED=true
         # not deleting all content as some things are hard coded in other config files 
         # such as /var/lib/kubelet/kubeconfig  
