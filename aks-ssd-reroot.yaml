@@ -1,0 +1,209 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reroot-config
+  namespace: kube-system
+data:
+  reroot: |
+    #!/bin/bash
+
+    # set -euo pipefail ( commented out due to issue at line 32 )
+
+    MOUNT=/data
+    DOCKER_DATA_ROOT=${MOUNT}/docker
+    KUBELET_DATA_ROOT=${MOUNT}/kubelet
+    DOCKER_ORIG_ROOT=/var/lib/docker
+    KUBELET_ORIG_ROOT=/var/lib/kubelet    
+    STAMP=$(date "+%Y.%m.%d-%H.%M.%S")
+
+    #################################################
+    # configure docker data directory
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   target directory for docker workspace
+    # Returns:
+    #   None
+    #################################################
+    verf_dd () {
+        mkdir -p $1
+        var=$(jq '. | ."data-root"' /etc/docker/daemon.json)
+        if [[ "$var" != \""$1\"" ]]; then
+            echo "configuring docker work dir to $1" 
+            cp -f /etc/docker/daemon.json /etc/docker/daemon.json-${STAMP}.bak
+            cat /etc/docker/daemon.json | jq --arg data_root "$1" '. + {"data-root": $data_root}' > /etc/docker/daemon.json.new
+            mv -f /etc/docker/daemon.json.new /etc/docker/daemon.json
+            CHANGED=true 
+        fi
+    }
+
+    #################################################
+    # configure kubelet data directory
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   target directory for kubelet workspace
+    # Returns:
+    #   None
+    #################################################
+    verf_kd () {
+        mkdir -p $1
+        cp -f /etc/default/kubelet /etc/default/kubelet-${STAMP}.bak
+        var=$(grep "KUBELET_OPTS=" /etc/default/kubelet | grep 'root-dir' | grep $1 )
+        if [[ ! -z "$var" ]]; then
+            return
+        fi
+        
+        var=$(grep "KUBELET_OPTS=" /etc/default/kubelet | grep 'root-dir' )    
+        if [[ ! -z "$var" ]]; then
+            echo "configuring kubelet work dir to $1" 
+            sed -i "s~\(root-dir=\).* \(.*\)~\1$1 \2~g" /etc/default/kubelet
+            CHANGED=true
+        else
+            echo "configuring kubelet work dir to $1" 
+            sed -i "s~KUBELET_OPTS=.*~KUBELET_OPTS=--root-dir=$1~" /etc/default/kubelet
+            CHANGED=true
+        fi
+    }
+
+    #################################################
+    # rsync from one local directory to local another
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   target directory for docker workspace
+    # Returns:
+    #   None
+    #################################################
+    verf_sync () {
+        if [ ! -d "$1" ]; then
+            echo "$1 does not exist, cannot rsync from source"
+            return
+        elif [ -z "$(ls -A $1)" ]; then
+            echo "$1 is empty, cannot rsync from source"
+            return
+        fi 
+        if [ -d "$2" ]; then
+            if [ ! -z "$(ls -A $2)" ]; then
+                echo "$1 is not empty, should not need to rsync"
+                return
+            fi
+        fi
+        mkdir -p $2
+        echo "synchronizing $1 to $2" 
+        rsync -avzhW --no-compress $1/ $2  > /var/log/rsync-${STAMP}.log 2>&1
+        CHANGED=true
+        # not deleting all content as some things are hard coded in other config files 
+        # such as /var/lib/kubelet/kubeconfig  
+        # rm -Rf $1/*
+    }
+
+    err() {
+        echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $@" >&2
+        exit 1
+    }
+
+    #################################################
+    # MAIN
+    #################################################
+    main () {
+
+        CHANGED=false
+
+        # verify docker config
+        verf_dd ${DOCKER_DATA_ROOT}
+
+        
+        # verify kubelet config
+        verf_kd ${KUBELET_DATA_ROOT}
+        # should not be symlink, not testing for -L
+        if [ "$CHANGED" == true ]; then
+
+            echo "stop docker containers if needed"
+            systemctl is-active --quiet docker || docker stop $(docker ps -a -q) 
+
+            echo "stop docker if needed"
+            systemctl is-active --quiet docker || systemctl stop docker
+
+            echo "stop kubelet if needed"
+            systemctl is-active --quiet kubelet || systemctl stop kubelet
+
+            echo "sync docker"
+            verf_sync ${DOCKER_ORIG_ROOT} ${DOCKER_DATA_ROOT}
+
+            echo "sync kubelet"
+            verf_bind ${KUBELET_ORIG_ROOT} ${KUBELET_DATA_ROOT}
+
+            systemctl daemon-reload
+            systemctl is-enabled --quiet docker && systemctl restart docker
+            systemctl is-enabled --quiet kubelet && systemctl restart kubelet
+
+        fi
+
+        echo "ensure enable docker and kubelet"
+        systemctl is-enabled --quiet docker || systemctl enable docker
+        systemctl is-enabled --quiet kubelet || systemctl enable kubelet
+
+        echo "ensure docker and kubelet started"
+        systemctl is-active --quiet docker || systemctl start docker
+        systemctl is-active --quiet kubelet || systemctl start kubelet
+        exit 0
+    } 
+
+    main "$@"
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aks-reroot
+  namespace: kube-system
+  labels:
+    k8s-app: aks-reroot
+spec:
+  selector:
+    matchLabels:
+      name: aks-reroot
+  template:
+    metadata:
+      labels:
+        name: aks-reroot
+    spec:
+      hostPID: true # For entering the host mont namespace via init
+      initContainers:
+      - name: init
+        image: syncroswitch/aks-reroot:v0.7
+        env:
+        - name: MODE
+          value: "INIT"
+        resources:
+          limits:
+            memory: 100Mi
+          requests:
+            cpu: 10m
+            memory: 50Mi
+        securityContext:
+          privileged: true # For nsenter /proc/1/ns/mnt
+        volumeMounts:
+        - name: per-boot
+          mountPath: /app/per-boot
+        - name: config-volume
+          mountPath: /app/reroot
+          subPath: reroot
+      containers:
+      - name: aks-reroot
+        image: syncroswitch/aks-reroot:v0.7
+        resources:
+          limits:
+            memory: 100Mi
+          requests:
+            cpu: 10m
+            memory: 50Mi
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: config-volume
+        configMap:
+          name: reroot-config
+      - name: per-boot
+        hostPath:
+          path: /var/lib/cloud/scripts/per-boot
